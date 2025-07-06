@@ -612,8 +612,19 @@ def create_tts_batch_method(tts_model):
             with cache_lock:
                 if wav_path not in conditioning_cache:
                     try:
-                        # Usar o modelo interno para obter conditioning latents
-                        gpt_cond_latent, speaker_embedding = tts_model.model.get_conditioning_latents(
+                        # Acessar o modelo interno corretamente
+                        if hasattr(tts_model, 'synthesizer') and hasattr(tts_model.synthesizer, 'tts_model'):
+                            # Para modelos carregados via TTS API
+                            model_internal = tts_model.synthesizer.tts_model
+                        elif hasattr(tts_model, 'model_manager') and hasattr(tts_model.model_manager, 'model'):
+                            # Para outros casos
+                            model_internal = tts_model.model_manager.model
+                        else:
+                            # Fallback: usar o método TTS diretamente (sem cache)
+                            logger.warning("Não foi possível acessar modelo interno, usando TTS direto")
+                            return None, None
+                            
+                        gpt_cond_latent, speaker_embedding = model_internal.get_conditioning_latents(
                             audio_path=[wav_path]
                         )
                         conditioning_cache[wav_path] = (gpt_cond_latent, speaker_embedding)
@@ -626,22 +637,33 @@ def create_tts_batch_method(tts_model):
             """Processa um único texto"""
             text, index = text_index_pair
             try:
-                # Obter conditioning latents (cached)
+                # Tentar usar conditioning latents cached
                 gpt_cond_latent, speaker_embedding = get_conditioning_latents(speaker_wav)
-                if gpt_cond_latent is None:
-                    logger.error(f"Falha ao obter conditioning latents para índice {index}")
-                    return index, None
                 
-                # Inferência usando o modelo interno
-                with torch.inference_mode():
-                    out = tts_model.model.inference(
-                        text=text,
-                        language=language,
-                        gpt_cond_latent=gpt_cond_latent,
-                        speaker_embedding=speaker_embedding,
-                        **kwargs
-                    )
-                    wav = torch.tensor(out["wav"])
+                if gpt_cond_latent is not None and speaker_embedding is not None:
+                    # Usar modelo interno com conditioning latents
+                    if hasattr(tts_model, 'synthesizer') and hasattr(tts_model.synthesizer, 'tts_model'):
+                        model_internal = tts_model.synthesizer.tts_model
+                    elif hasattr(tts_model, 'model_manager') and hasattr(tts_model.model_manager, 'model'):
+                        model_internal = tts_model.model_manager.model
+                    else:
+                        raise Exception("Modelo interno não encontrado")
+                        
+                    with torch.inference_mode():
+                        out = model_internal.inference(
+                            text=text,
+                            language=language,
+                            gpt_cond_latent=gpt_cond_latent,
+                            speaker_embedding=speaker_embedding,
+                            **kwargs
+                        )
+                        wav = torch.tensor(out["wav"])
+                else:
+                    # Fallback: usar método TTS direto
+                    logger.debug(f"Usando TTS direto para texto {index}")
+                    wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
+                    if not isinstance(wav, torch.Tensor):
+                        wav = torch.tensor(wav)
                     
                 logger.debug(f"Texto {index} processado com sucesso")
                 return index, wav
@@ -651,7 +673,7 @@ def create_tts_batch_method(tts_model):
                 return index, None
         
         # Determinar número de threads baseado no batch size e recursos
-        max_workers = min(len(texts), 4)  # Limitar threads para não sobrecarregar
+        max_workers = min(len(texts), 2)  # Reduzir threads para evitar conflitos
         
         # Processar em paralelo
         results = [None] * len(texts)
@@ -665,7 +687,8 @@ def create_tts_batch_method(tts_model):
             
             for future in concurrent.futures.as_completed(future_to_index):
                 index, wav = future.result()
-                results[index] = wav
+                if wav is not None:
+                    results[index] = wav
                 
         # Filtrar resultados None
         valid_results = [wav for wav in results if wav is not None]
