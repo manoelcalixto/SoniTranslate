@@ -650,11 +650,14 @@ def segments_coqui_tts(
 
     from collections import defaultdict
 
-    # Use provided batch_size or fallback to environment variable
-    if batch_size is None:
-        batch_size_env = max(1, int(os.getenv("COQUI_TTS_BATCH", "2")))
-    else:
+    # Use environment variable COQUI_TTS_BATCH as priority, fallback to provided batch_size
+    coqui_batch_env = os.getenv("COQUI_TTS_BATCH")
+    if coqui_batch_env is not None:
+        batch_size_env = max(1, int(coqui_batch_env))
+    elif batch_size is not None:
         batch_size_env = max(1, batch_size)
+    else:
+        batch_size_env = 2
 
     # Group segments by speaker_wav (tts_name) so a single reference voice is
     # used inside each batch – a requirement of `tts_batch`.
