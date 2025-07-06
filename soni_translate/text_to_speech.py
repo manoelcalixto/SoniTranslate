@@ -642,44 +642,75 @@ def segments_coqui_tts(
     model = TTS(model_id_coqui).to(device)
     sampling_rate = 24000
 
-    # filtered_segments = filtered_coqui_segments['segments']
-    # Sorting the segments by 'tts_name'
-    # sorted_segments = sorted(filtered_segments, key=lambda x: x['tts_name'])
-    # logger.debug(sorted_segments)
+    # ===== BATCH PROCESSING IMPLEMENTATION =====
+    # Process segments in mini-batches to improve GPU utilisation and reduce
+    # per-segment overhead. Batch size can be controlled with the environment
+    # variable `COQUI_TTS_BATCH` (default = 2).
 
-    for segment in tqdm(filtered_coqui_segments["segments"]):
-        speaker = segment["speaker"]
-        text = segment["text"]
-        start = segment["start"]
-        tts_name = segment["tts_name"]
-        if tts_name == "_XTTS_/AUTOMATIC.wav":
-            tts_name = f"_XTTS_/AUTOMATIC_{speaker}.wav"
+    from collections import defaultdict
 
-        # make the tts audio
-        filename = f"audio/{start}.ogg"
-        logger.info(f"{text} >> {filename}")
-        try:
-            # Infer
-            wav = model.tts(
-                text=text, speaker_wav=tts_name, language=TRANSLATE_AUDIO_TO
-            )
-            data_tts = pad_array(
-                wav,
-                sampling_rate,
-            )
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sampling_rate,
-                data=data_tts,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
-        except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
-        gc.collect()
-        torch.cuda.empty_cache()
+    batch_size_env = max(1, int(os.getenv("COQUI_TTS_BATCH", "2")))
+
+    # Group segments by speaker_wav (tts_name) so a single reference voice is
+    # used inside each batch – a requirement of `tts_batch`.
+    segments_by_wav = defaultdict(list)
+    for seg in filtered_coqui_segments["segments"]:
+        wav_path = seg["tts_name"]
+        if wav_path == "_XTTS_/AUTOMATIC.wav":
+            wav_path = f"_XTTS_/AUTOMATIC_{seg['speaker']}.wav"
+        segments_by_wav[wav_path].append(seg)
+
+    # Iterate through each voice and synthesise the associated segments in
+    # chunks of `batch_size_env`.
+    for wav_path, segs in segments_by_wav.items():
+        texts = [s["text"] for s in segs]
+        starts = [s["start"] for s in segs]
+
+        for idx in range(0, len(texts), batch_size_env):
+            batch_texts = texts[idx : idx + batch_size_env]
+            batch_starts = starts[idx : idx + batch_size_env]
+
+            try:
+                # Prefer the intrinsic batch method if available.
+                if hasattr(model, "tts_batch"):
+                    wav_outputs = model.tts_batch(
+                        texts=batch_texts,
+                        speaker_wav=wav_path,
+                        language=TRANSLATE_AUDIO_TO,
+                    )
+                else:
+                    # Fallback to sequential inference inside the mini-batch.
+                    wav_outputs = [
+                        model.tts(text=t, speaker_wav=wav_path, language=TRANSLATE_AUDIO_TO)
+                        for t in batch_texts
+                    ]
+
+                # Save each generated waveform.
+                for wav_out, start_time in zip(wav_outputs, batch_starts):
+                    filename = f"audio/{start_time}.ogg"
+                    logger.info(f"{start_time} >> {filename}")
+                    data_tts = pad_array(wav_out, sampling_rate)
+                    write_chunked(
+                        file=filename,
+                        samplerate=sampling_rate,
+                        data=data_tts,
+                        format="ogg",
+                        subtype="vorbis",
+                    )
+                    verify_saved_file_and_size(filename)
+
+            except Exception as error:
+                # Record an error for each file in the failed mini-batch.
+                for start_time in batch_starts:
+                    filename = f"audio/{start_time}.ogg"
+                    dummy_seg = {"start": start_time, "text": ""}
+                    error_handling_in_tts(error, dummy_seg, TRANSLATE_AUDIO_TO, filename)
+
+            # Clear memory between mini-batches.
+            gc.collect()
+            torch.cuda.empty_cache()
+    # ===== END BATCH PROCESSING =====
+
     try:
         del model
         gc.collect()
