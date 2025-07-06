@@ -603,6 +603,15 @@ def create_tts_batch_method(tts_model):
         if not texts:
             return []
             
+        logger.info(f"🔥 Iniciando batch processing de {len(texts)} textos")
+        logger.debug(f"🔥 TTS Model type: {type(tts_model)}")
+        logger.debug(f"🔥 TTS Model attributes: {dir(tts_model)}")
+        
+        # Verificar se o arquivo speaker existe
+        if not os.path.exists(speaker_wav):
+            logger.error(f"Arquivo speaker não encontrado: {speaker_wav}")
+            return []
+            
         # Cache dos conditioning latents para evitar recalcular
         conditioning_cache = {}
         cache_lock = threading.Lock()
@@ -612,83 +621,101 @@ def create_tts_batch_method(tts_model):
             with cache_lock:
                 if wav_path not in conditioning_cache:
                     try:
-                        # Acessar o modelo interno corretamente
-                        if hasattr(tts_model, 'synthesizer') and hasattr(tts_model.synthesizer, 'tts_model'):
-                            # Para modelos carregados via TTS API
-                            model_internal = tts_model.synthesizer.tts_model
-                        elif hasattr(tts_model, 'model_manager') and hasattr(tts_model.model_manager, 'model'):
-                            # Para outros casos
-                            model_internal = tts_model.model_manager.model
-                        else:
+                        # Verificar diferentes estruturas do modelo TTS
+                        model_internal = None
+                        
+                        # Tentar várias formas de acessar o modelo interno
+                        if hasattr(tts_model, 'synthesizer') and tts_model.synthesizer is not None:
+                            if hasattr(tts_model.synthesizer, 'tts_model'):
+                                model_internal = tts_model.synthesizer.tts_model
+                                logger.debug("✅ Encontrado modelo via synthesizer.tts_model")
+                        
+                        if model_internal is None and hasattr(tts_model, 'model_manager') and tts_model.model_manager is not None:
+                            if hasattr(tts_model.model_manager, 'model'):
+                                model_internal = tts_model.model_manager.model
+                                logger.debug("✅ Encontrado modelo via model_manager.model")
+                        
+                        if model_internal is None and hasattr(tts_model, 'model'):
+                            model_internal = tts_model.model
+                            logger.debug("✅ Encontrado modelo via model")
+                            
+                        if model_internal is None:
                             # Fallback: usar o método TTS diretamente (sem cache)
-                            logger.warning("Não foi possível acessar modelo interno, usando TTS direto")
+                            logger.warning("❌ Não foi possível acessar modelo interno, usando TTS direto")
                             return None, None
                             
-                        gpt_cond_latent, speaker_embedding = model_internal.get_conditioning_latents(
-                            audio_path=[wav_path]
-                        )
-                        conditioning_cache[wav_path] = (gpt_cond_latent, speaker_embedding)
+                        # Tentar obter conditioning latents
+                        if hasattr(model_internal, 'get_conditioning_latents'):
+                            gpt_cond_latent, speaker_embedding = model_internal.get_conditioning_latents(
+                                audio_path=[wav_path]
+                            )
+                            conditioning_cache[wav_path] = (gpt_cond_latent, speaker_embedding)
+                            logger.debug("✅ Conditioning latents obtidos com sucesso")
+                        else:
+                            logger.warning("❌ Método get_conditioning_latents não encontrado")
+                            return None, None
+                            
                     except Exception as e:
-                        logger.error(f"Erro ao obter conditioning latents: {e}")
+                        logger.error(f"❌ Erro ao obter conditioning latents: {e}")
                         return None, None
+                        
                 return conditioning_cache[wav_path]
         
-        def process_single_text(text_index_pair):
-            """Processa um único texto"""
+        def process_single_text_simple(text_index_pair):
+            """Processa um único texto usando o método TTS direto (mais simples)"""
             text, index = text_index_pair
             try:
-                # Tentar usar conditioning latents cached
-                gpt_cond_latent, speaker_embedding = get_conditioning_latents(speaker_wav)
+                logger.debug(f"🔄 Processando texto {index}: {text[:50]}...")
+                wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
                 
-                if gpt_cond_latent is not None and speaker_embedding is not None:
-                    # Usar modelo interno com conditioning latents
-                    if hasattr(tts_model, 'synthesizer') and hasattr(tts_model.synthesizer, 'tts_model'):
-                        model_internal = tts_model.synthesizer.tts_model
-                    elif hasattr(tts_model, 'model_manager') and hasattr(tts_model.model_manager, 'model'):
-                        model_internal = tts_model.model_manager.model
-                    else:
-                        raise Exception("Modelo interno não encontrado")
-                        
-                    with torch.inference_mode():
-                        out = model_internal.inference(
-                            text=text,
-                            language=language,
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
-                            **kwargs
-                        )
-                        wav = torch.tensor(out["wav"])
-                else:
-                    # Fallback: usar método TTS direto
-                    logger.debug(f"Usando TTS direto para texto {index}")
-                    wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
-                    if not isinstance(wav, torch.Tensor):
-                        wav = torch.tensor(wav)
+                if not isinstance(wav, torch.Tensor):
+                    wav = torch.tensor(wav)
                     
-                logger.debug(f"Texto {index} processado com sucesso")
+                logger.debug(f"✅ Texto {index} processado com sucesso")
                 return index, wav
                 
             except Exception as e:
-                logger.error(f"Erro ao processar texto {index}: {e}")
+                logger.error(f"❌ Erro ao processar texto {index}: {e}")
                 return index, None
         
+        # Para agora, vamos usar a abordagem mais simples que sabemos que funciona
+        logger.info("🔄 Usando processamento paralelo simplificado")
+        
         # Determinar número de threads baseado no batch size e recursos
-        max_workers = min(len(texts), 2)  # Reduzir threads para evitar conflitos
+        max_workers = min(len(texts), 2)  # Começar com apenas 2 threads
         
         # Processar em paralelo
-        results = {}  # Usar dict em vez de lista para evitar problemas de tipo
+        results = {}
         text_index_pairs = list(enumerate(texts))
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_index = {
-                executor.submit(process_single_text, (text, i)): i 
-                for i, text in enumerate(texts)
-            }
-            
-            for future in concurrent.futures.as_completed(future_to_index):
-                index, wav = future.result()
-                if wav is not None:
-                    results[index] = wav
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(process_single_text_simple, (text, i)): i 
+                    for i, text in enumerate(texts)
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index, wav = future.result()
+                    if wav is not None:
+                        results[index] = wav
+                        logger.debug(f"✅ Resultado {index} coletado com sucesso")
+                    else:
+                        logger.error(f"❌ Resultado {index} falhou")
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro no ThreadPoolExecutor: {e}")
+            # Fallback total: processamento sequencial
+            logger.info("🔄 Fallback para processamento sequencial")
+            for i, text in enumerate(texts):
+                try:
+                    wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
+                    if not isinstance(wav, torch.Tensor):
+                        wav = torch.tensor(wav)
+                    results[i] = wav
+                    logger.debug(f"✅ Texto sequencial {i} processado")
+                except Exception as seq_error:
+                    logger.error(f"❌ Erro sequencial no texto {i}: {seq_error}")
                 
         # Criar lista ordenada de resultados válidos
         valid_results = []
@@ -696,8 +723,10 @@ def create_tts_batch_method(tts_model):
             if i in results:
                 valid_results.append(results[i])
         
+        logger.info(f"🔥 Batch finalizado: {len(valid_results)}/{len(texts)} sucessos")
+        
         if len(valid_results) != len(texts):
-            logger.warning(f"Alguns textos falharam: {len(valid_results)}/{len(texts)} sucessos")
+            logger.warning(f"⚠️ Alguns textos falharam: {len(valid_results)}/{len(texts)} sucessos")
             
         return valid_results
     
@@ -822,28 +851,56 @@ def segments_coqui_tts(
                 end_time = time.time()
                 logger.info(f"🔥 Batch processado em {end_time - start_time:.2f}s")
 
+                # Verificar se temos outputs válidos
+                if not wav_outputs or len(wav_outputs) == 0:
+                    raise Exception("Nenhum output válido do batch processing")
+
                 # Save each generated waveform.
-                for wav_out, start_time in zip(wav_outputs, batch_starts):
+                saved_files = []
+                for i, (wav_out, start_time) in enumerate(zip(wav_outputs, batch_starts)):
                     filename = f"audio/{start_time}.ogg"
                     logger.info(f"{start_time} >> {filename}")
-                    data_tts = pad_array(wav_out.numpy(), sampling_rate)
-                    write_chunked(
-                        file=filename,
-                        samplerate=sampling_rate,
-                        data=data_tts,
-                        format="ogg",
-                        subtype="vorbis",
-                    )
-                    verify_saved_file_and_size(filename)
+                    
+                    # Verificar se o tensor é válido
+                    if wav_out is None or not hasattr(wav_out, 'numpy'):
+                        logger.error(f"Tensor inválido para {filename}")
+                        continue
+                        
+                    try:
+                        data_tts = pad_array(wav_out.numpy(), sampling_rate)
+                        write_chunked(
+                            file=filename,
+                            samplerate=sampling_rate,
+                            data=data_tts,
+                            format="ogg",
+                            subtype="vorbis",
+                        )
+                        verify_saved_file_and_size(filename)
+                        saved_files.append(filename)
+                        logger.debug(f"✅ Arquivo salvo com sucesso: {filename}")
+                    except Exception as save_error:
+                        logger.error(f"❌ Erro ao salvar {filename}: {save_error}")
+                
+                logger.info(f"🔥 Batch salvou {len(saved_files)}/{len(wav_outputs)} arquivos")
+                
+                # Se não conseguiu salvar nenhum arquivo, lançar exceção para fallback
+                if len(saved_files) == 0:
+                    raise Exception("Nenhum arquivo foi salvo com sucesso")
 
             except Exception as error:
-                logger.error(f"Erro no batch processing: {error}")
+                logger.error(f"❌ Erro no batch processing: {error}")
                 # Fallback para processamento sequencial em caso de erro
-                logger.info(f"🔥 Fallback: Processando {len(batch_texts)} textos SEQUENCIALMENTE")
+                logger.info(f"🔄 Fallback: Processando {len(batch_texts)} textos SEQUENCIALMENTE")
+                
                 for text, start_time in zip(batch_texts, batch_starts):
+                    filename = f"audio/{start_time}.ogg"
                     try:
+                        logger.debug(f"🔄 Processando sequencial: {text[:50]}...")
                         wav_out = model.tts(text=text, speaker_wav=wav_path, language=TRANSLATE_AUDIO_TO)
-                        filename = f"audio/{start_time}.ogg"
+                        
+                        if wav_out is None:
+                            raise Exception("TTS retornou None")
+                            
                         logger.info(f"{start_time} >> {filename}")
                         data_tts = pad_array(wav_out, sampling_rate)
                         write_chunked(
@@ -854,9 +911,11 @@ def segments_coqui_tts(
                             subtype="vorbis",
                         )
                         verify_saved_file_and_size(filename)
+                        logger.debug(f"✅ Sequencial salvo: {filename}")
+                        
                     except Exception as fallback_error:
+                        logger.error(f"❌ Erro sequencial em {filename}: {fallback_error}")
                         # Record an error for the failed file
-                        filename = f"audio/{start_time}.ogg"
                         dummy_seg = {"start": start_time, "text": text}
                         error_handling_in_tts(fallback_error, dummy_seg, TRANSLATE_AUDIO_TO, filename)
 
