@@ -588,6 +588,7 @@ def segments_coqui_tts(
     delete_previous_automatic=True,
     dereverb_automatic=True,
     emotion=None,
+    batch_size=None,
 ):
     """XTTS
     Install:
@@ -644,12 +645,16 @@ def segments_coqui_tts(
 
     # ===== BATCH PROCESSING IMPLEMENTATION =====
     # Process segments in mini-batches to improve GPU utilisation and reduce
-    # per-segment overhead. Batch size can be controlled with the environment
-    # variable `COQUI_TTS_BATCH` (default = 2).
+    # per-segment overhead. Batch size can be controlled with the parameter
+    # `batch_size` (default = 2 from environment variable COQUI_TTS_BATCH).
 
     from collections import defaultdict
 
-    batch_size_env = max(1, int(os.getenv("COQUI_TTS_BATCH", "2")))
+    # Use provided batch_size or fallback to environment variable
+    if batch_size is None:
+        batch_size_env = max(1, int(os.getenv("COQUI_TTS_BATCH", "2")))
+    else:
+        batch_size_env = max(1, batch_size)
 
     # Group segments by speaker_wav (tts_name) so a single reference voice is
     # used inside each batch – a requirement of `tts_batch`.
@@ -1015,6 +1020,7 @@ def audio_segmentation_to_voice(
     model_id_bark="suno/bark-small",
     model_id_coqui="tts_models/multilingual/multi-dataset/xtts_v2",
     delete_previous_automatic=True,
+    batch_size=None,
 ):
 
     remove_directory_contents("audio")
@@ -1096,6 +1102,7 @@ def audio_segmentation_to_voice(
             speakers_coqui,
             delete_previous_automatic,
             dereverb_automatic,
+            batch_size=batch_size,
         )  # wav
     if filtered_vits_onnx["segments"]:
         logger.info(f"PIPER TTS: {speakers_vits_onnx}")
