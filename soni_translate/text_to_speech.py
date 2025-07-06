@@ -654,10 +654,13 @@ def segments_coqui_tts(
     coqui_batch_env = os.getenv("COQUI_TTS_BATCH")
     if coqui_batch_env is not None:
         batch_size_env = max(1, int(coqui_batch_env))
+        logger.info(f"🔥 COQUI_TTS_BATCH definido: {coqui_batch_env}, usando batch_size: {batch_size_env}")
     elif batch_size is not None:
         batch_size_env = max(1, batch_size)
+        logger.info(f"🔥 Usando batch_size do parâmetro: {batch_size_env}")
     else:
         batch_size_env = 2
+        logger.info(f"🔥 Usando batch_size padrão: {batch_size_env}")
 
     # Group segments by speaker_wav (tts_name) so a single reference voice is
     # used inside each batch – a requirement of `tts_batch`.
@@ -681,6 +684,7 @@ def segments_coqui_tts(
             try:
                 # Prefer the intrinsic batch method if available.
                 if hasattr(model, "tts_batch"):
+                    logger.info(f"🔥 Processando BATCH com {len(batch_texts)} textos usando tts_batch")
                     wav_outputs = model.tts_batch(
                         texts=batch_texts,
                         speaker_wav=wav_path,
@@ -688,6 +692,7 @@ def segments_coqui_tts(
                     )
                 else:
                     # Fallback to sequential inference inside the mini-batch.
+                    logger.info(f"🔥 Processando {len(batch_texts)} textos SEQUENCIALMENTE (fallback)")
                     wav_outputs = [
                         model.tts(text=t, speaker_wav=wav_path, language=TRANSLATE_AUDIO_TO)
                         for t in batch_texts
