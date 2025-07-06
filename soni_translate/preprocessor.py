@@ -88,7 +88,7 @@ def audio_video_preprocessor(
     if os.path.exists(video):
         if preview:
             logger.warning(
-                "Creating a preview video of 10 seconds, "
+                "Creating a preview video of 60 seconds, "
                 "to disable this option, go to advanced "
                 "settings and turn off preview."
             )
