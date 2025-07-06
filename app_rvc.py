@@ -969,6 +969,7 @@ class SoniTranslate(SoniTrCache):
                 tts_voice10,
                 tts_voice11,
                 dereverb_automatic_xtts,
+                batch_size=batch_size,
             )
 
         if not self.task_in_cache("acc_and_vc", [
@@ -1196,6 +1197,7 @@ class SoniTranslate(SoniTrCache):
             tgt_lang,
             is_gui,
             tts,
+            batch_size=4,  # Default batch size for document processing
         )
 
         # fix format and set folder output
@@ -1386,6 +1388,7 @@ class SoniTranslate(SoniTrCache):
             TRANSLATE_AUDIO_TO,
             is_gui,
             tts_voice00,
+            batch_size=4,  # Default batch size for document processing
         )
 
         # fix format and set folder output
