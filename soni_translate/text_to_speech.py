@@ -645,8 +645,8 @@ def segments_coqui_tts(
 
     # ===== BATCH PROCESSING IMPLEMENTATION =====
     # Process segments in mini-batches to improve GPU utilisation and reduce
-    # per-segment overhead. Batch size can be controlled with the parameter
-    # `batch_size` (default = 2 from environment variable COQUI_TTS_BATCH).
+    # per-segment overhead. Batch size is prioritized from environment variable 
+    # COQUI_TTS_BATCH, fallback to `batch_size` parameter (default = 2).
 
     from collections import defaultdict
 
