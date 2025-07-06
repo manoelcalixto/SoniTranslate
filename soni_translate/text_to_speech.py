@@ -18,13 +18,16 @@ from .utils import (
     write_chunked,
 )
 import numpy as np
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 import soundfile as sf
 import platform
 import logging
 import traceback
 from .logging_setup import logger
+import concurrent.futures
+import threading
+import time
 
 
 class TTS_OperationError(Exception):
@@ -580,6 +583,101 @@ def create_new_files_for_vc(
                     )
 
 
+def create_tts_batch_method(tts_model):
+    """
+    Cria um método tts_batch real para a instância TTS
+    """
+    def tts_batch(texts: List[str], speaker_wav: str, language: str, **kwargs) -> List[torch.Tensor]:
+        """
+        Processa múltiplos textos em paralelo usando threading otimizado
+        
+        Args:
+            texts: Lista de textos para processar
+            speaker_wav: Caminho para o arquivo de áudio do speaker
+            language: Linguagem alvo
+            **kwargs: Argumentos adicionais para o TTS
+            
+        Returns:
+            Lista de tensors de áudio gerados
+        """
+        if not texts:
+            return []
+            
+        # Cache dos conditioning latents para evitar recalcular
+        conditioning_cache = {}
+        cache_lock = threading.Lock()
+        
+        def get_conditioning_latents(wav_path):
+            """Obtém conditioning latents com cache thread-safe"""
+            with cache_lock:
+                if wav_path not in conditioning_cache:
+                    try:
+                        # Usar o modelo interno para obter conditioning latents
+                        gpt_cond_latent, speaker_embedding = tts_model.model.get_conditioning_latents(
+                            audio_path=[wav_path]
+                        )
+                        conditioning_cache[wav_path] = (gpt_cond_latent, speaker_embedding)
+                    except Exception as e:
+                        logger.error(f"Erro ao obter conditioning latents: {e}")
+                        return None, None
+                return conditioning_cache[wav_path]
+        
+        def process_single_text(text_index_pair):
+            """Processa um único texto"""
+            text, index = text_index_pair
+            try:
+                # Obter conditioning latents (cached)
+                gpt_cond_latent, speaker_embedding = get_conditioning_latents(speaker_wav)
+                if gpt_cond_latent is None:
+                    logger.error(f"Falha ao obter conditioning latents para índice {index}")
+                    return index, None
+                
+                # Inferência usando o modelo interno
+                with torch.inference_mode():
+                    out = tts_model.model.inference(
+                        text=text,
+                        language=language,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        **kwargs
+                    )
+                    wav = torch.tensor(out["wav"])
+                    
+                logger.debug(f"Texto {index} processado com sucesso")
+                return index, wav
+                
+            except Exception as e:
+                logger.error(f"Erro ao processar texto {index}: {e}")
+                return index, None
+        
+        # Determinar número de threads baseado no batch size e recursos
+        max_workers = min(len(texts), 4)  # Limitar threads para não sobrecarregar
+        
+        # Processar em paralelo
+        results = [None] * len(texts)
+        text_index_pairs = list(enumerate(texts))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(process_single_text, (text, i)): i 
+                for i, text in enumerate(texts)
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_index):
+                index, wav = future.result()
+                results[index] = wav
+                
+        # Filtrar resultados None
+        valid_results = [wav for wav in results if wav is not None]
+        
+        if len(valid_results) != len(texts):
+            logger.warning(f"Alguns textos falharam: {len(valid_results)}/{len(texts)} sucessos")
+            
+        return valid_results
+    
+    return tts_batch
+
+
 def segments_coqui_tts(
     filtered_coqui_segments,
     TRANSLATE_AUDIO_TO,
@@ -643,6 +741,9 @@ def segments_coqui_tts(
     model = TTS(model_id_coqui).to(device)
     sampling_rate = 24000
 
+    # ADICIONAR MÉTODO TTS_BATCH REAL
+    model.tts_batch = create_tts_batch_method(model)
+
     # ===== BATCH PROCESSING IMPLEMENTATION =====
     # Process segments in mini-batches to improve GPU utilisation and reduce
     # per-segment overhead. Batch size is prioritized from environment variable 
@@ -682,27 +783,24 @@ def segments_coqui_tts(
             batch_starts = starts[idx : idx + batch_size_env]
 
             try:
-                # Prefer the intrinsic batch method if available.
-                if hasattr(model, "tts_batch"):
-                    logger.info(f"🔥 Processando BATCH com {len(batch_texts)} textos usando tts_batch")
-                    wav_outputs = model.tts_batch(
-                        texts=batch_texts,
-                        speaker_wav=wav_path,
-                        language=TRANSLATE_AUDIO_TO,
-                    )
-                else:
-                    # Fallback to sequential inference inside the mini-batch.
-                    logger.info(f"🔥 Processando {len(batch_texts)} textos SEQUENCIALMENTE (fallback)")
-                    wav_outputs = [
-                        model.tts(text=t, speaker_wav=wav_path, language=TRANSLATE_AUDIO_TO)
-                        for t in batch_texts
-                    ]
+                # USAR O MÉTODO TTS_BATCH REAL
+                logger.info(f"🔥 Processando {len(batch_texts)} textos em BATCH PARALELO")
+                start_time = time.time()
+                
+                wav_outputs = model.tts_batch(
+                    texts=batch_texts,
+                    speaker_wav=wav_path,
+                    language=TRANSLATE_AUDIO_TO
+                )
+                
+                end_time = time.time()
+                logger.info(f"🔥 Batch processado em {end_time - start_time:.2f}s")
 
                 # Save each generated waveform.
                 for wav_out, start_time in zip(wav_outputs, batch_starts):
                     filename = f"audio/{start_time}.ogg"
                     logger.info(f"{start_time} >> {filename}")
-                    data_tts = pad_array(wav_out, sampling_rate)
+                    data_tts = pad_array(wav_out.numpy(), sampling_rate)
                     write_chunked(
                         file=filename,
                         samplerate=sampling_rate,
@@ -713,11 +811,28 @@ def segments_coqui_tts(
                     verify_saved_file_and_size(filename)
 
             except Exception as error:
-                # Record an error for each file in the failed mini-batch.
-                for start_time in batch_starts:
-                    filename = f"audio/{start_time}.ogg"
-                    dummy_seg = {"start": start_time, "text": ""}
-                    error_handling_in_tts(error, dummy_seg, TRANSLATE_AUDIO_TO, filename)
+                logger.error(f"Erro no batch processing: {error}")
+                # Fallback para processamento sequencial em caso de erro
+                logger.info(f"🔥 Fallback: Processando {len(batch_texts)} textos SEQUENCIALMENTE")
+                for text, start_time in zip(batch_texts, batch_starts):
+                    try:
+                        wav_out = model.tts(text=text, speaker_wav=wav_path, language=TRANSLATE_AUDIO_TO)
+                        filename = f"audio/{start_time}.ogg"
+                        logger.info(f"{start_time} >> {filename}")
+                        data_tts = pad_array(wav_out, sampling_rate)
+                        write_chunked(
+                            file=filename,
+                            samplerate=sampling_rate,
+                            data=data_tts,
+                            format="ogg",
+                            subtype="vorbis",
+                        )
+                        verify_saved_file_and_size(filename)
+                    except Exception as fallback_error:
+                        # Record an error for the failed file
+                        filename = f"audio/{start_time}.ogg"
+                        dummy_seg = {"start": start_time, "text": text}
+                        error_handling_in_tts(fallback_error, dummy_seg, TRANSLATE_AUDIO_TO, filename)
 
             # Clear memory between mini-batches.
             gc.collect()
