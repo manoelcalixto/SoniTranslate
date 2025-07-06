@@ -676,7 +676,7 @@ def create_tts_batch_method(tts_model):
         max_workers = min(len(texts), 2)  # Reduzir threads para evitar conflitos
         
         # Processar em paralelo
-        results = [None] * len(texts)
+        results = {}  # Usar dict em vez de lista para evitar problemas de tipo
         text_index_pairs = list(enumerate(texts))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -690,8 +690,11 @@ def create_tts_batch_method(tts_model):
                 if wav is not None:
                     results[index] = wav
                 
-        # Filtrar resultados None
-        valid_results = [wav for wav in results if wav is not None]
+        # Criar lista ordenada de resultados válidos
+        valid_results = []
+        for i in range(len(texts)):
+            if i in results:
+                valid_results.append(results[i])
         
         if len(valid_results) != len(texts):
             logger.warning(f"Alguns textos falharam: {len(valid_results)}/{len(texts)} sucessos")
@@ -765,7 +768,7 @@ def segments_coqui_tts(
     sampling_rate = 24000
 
     # ADICIONAR MÉTODO TTS_BATCH REAL
-    model.tts_batch = create_tts_batch_method(model)
+    setattr(model, 'tts_batch', create_tts_batch_method(model))
 
     # ===== BATCH PROCESSING IMPLEMENTATION =====
     # Process segments in mini-batches to improve GPU utilisation and reduce
