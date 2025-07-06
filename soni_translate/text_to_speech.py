@@ -28,6 +28,7 @@ from .logging_setup import logger
 import concurrent.futures
 import threading
 import time
+import multiprocessing
 
 
 class TTS_OperationError(Exception):
@@ -583,13 +584,56 @@ def create_new_files_for_vc(
                     )
 
 
+def process_single_text_worker(args):
+    """
+    Worker function para ProcessPoolExecutor
+    Cada processo carrega sua própria instância do modelo
+    """
+    text, index, speaker_wav, language, model_id_coqui, device_env, kwargs = args
+    
+    try:
+        # Importar dependências dentro do worker process
+        from TTS.api import TTS
+        import torch
+        import numpy as np
+        import logging
+        import os
+        
+        # Configurar logging básico no processo filho
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        
+        # Recriar instância do modelo no processo
+        device = device_env or os.environ.get("SONITR_DEVICE", "cpu")
+        tts_model = TTS(model_id_coqui).to(device)
+        
+        logger.debug(f"🔄 Worker {index}: Processando texto: {text[:50]}...")
+        
+        # Gerar áudio
+        wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
+        
+        if not isinstance(wav, torch.Tensor):
+            wav = torch.tensor(wav)
+            
+        logger.debug(f"✅ Worker {index}: Texto processado com sucesso")
+        return index, wav.cpu().numpy()  # Retornar numpy array para serialização
+        
+    except Exception as e:
+        # Usar print se logger não estiver disponível
+        try:
+            logger.error(f"❌ Worker {index}: Erro ao processar texto: {e}")
+        except:
+            print(f"❌ Worker {index}: Erro ao processar texto: {e}")
+        return index, None
+
+
 def create_tts_batch_method(tts_model):
     """
-    Cria um método tts_batch real para a instância TTS
+    Cria um método tts_batch real para a instância TTS usando ProcessPoolExecutor
     """
     def tts_batch(texts: List[str], speaker_wav: str, language: str, **kwargs) -> List[torch.Tensor]:
         """
-        Processa múltiplos textos em paralelo usando threading otimizado
+        Processa múltiplos textos em paralelo usando processos separados
         
         Args:
             texts: Lista de textos para processar
@@ -603,119 +647,79 @@ def create_tts_batch_method(tts_model):
         if not texts:
             return []
             
-        logger.info(f"🔥 Iniciando batch processing de {len(texts)} textos")
-        logger.debug(f"🔥 TTS Model type: {type(tts_model)}")
-        logger.debug(f"🔥 TTS Model attributes: {dir(tts_model)}")
+        logger.info(f"🔥 Iniciando batch processing de {len(texts)} textos com ProcessPool")
         
         # Verificar se o arquivo speaker existe
         if not os.path.exists(speaker_wav):
             logger.error(f"Arquivo speaker não encontrado: {speaker_wav}")
             return []
-            
-        # Cache dos conditioning latents para evitar recalcular
-        conditioning_cache = {}
-        cache_lock = threading.Lock()
         
-        def get_conditioning_latents(wav_path):
-            """Obtém conditioning latents com cache thread-safe"""
-            with cache_lock:
-                if wav_path not in conditioning_cache:
-                    try:
-                        # Verificar diferentes estruturas do modelo TTS
-                        model_internal = None
-                        
-                        # Tentar várias formas de acessar o modelo interno
-                        if hasattr(tts_model, 'synthesizer') and tts_model.synthesizer is not None:
-                            if hasattr(tts_model.synthesizer, 'tts_model'):
-                                model_internal = tts_model.synthesizer.tts_model
-                                logger.debug("✅ Encontrado modelo via synthesizer.tts_model")
-                        
-                        if model_internal is None and hasattr(tts_model, 'model_manager') and tts_model.model_manager is not None:
-                            if hasattr(tts_model.model_manager, 'model'):
-                                model_internal = tts_model.model_manager.model
-                                logger.debug("✅ Encontrado modelo via model_manager.model")
-                        
-                        if model_internal is None and hasattr(tts_model, 'model'):
-                            model_internal = tts_model.model
-                            logger.debug("✅ Encontrado modelo via model")
-                            
-                        if model_internal is None:
-                            # Fallback: usar o método TTS diretamente (sem cache)
-                            logger.warning("❌ Não foi possível acessar modelo interno, usando TTS direto")
-                            return None, None
-                            
-                        # Tentar obter conditioning latents
-                        if hasattr(model_internal, 'get_conditioning_latents'):
-                            gpt_cond_latent, speaker_embedding = model_internal.get_conditioning_latents(
-                                audio_path=[wav_path]
-                            )
-                            conditioning_cache[wav_path] = (gpt_cond_latent, speaker_embedding)
-                            logger.debug("✅ Conditioning latents obtidos com sucesso")
-                        else:
-                            logger.warning("❌ Método get_conditioning_latents não encontrado")
-                            return None, None
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Erro ao obter conditioning latents: {e}")
-                        return None, None
-                        
-                return conditioning_cache[wav_path]
+        # Obter configurações do modelo
+        model_id_coqui = getattr(tts_model, 'model_name', 'tts_models/multilingual/multi-dataset/xtts_v2')
+        if not model_id_coqui or model_id_coqui == 'tts_models/multilingual/multi-dataset/xtts_v2':
+            # Fallback para o parâmetro da função se disponível
+            model_id_coqui = 'tts_models/multilingual/multi-dataset/xtts_v2'
         
-        def process_single_text_simple(text_index_pair):
-            """Processa um único texto usando o método TTS direto (mais simples)"""
-            text, index = text_index_pair
-            try:
-                logger.debug(f"🔄 Processando texto {index}: {text[:50]}...")
-                wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
-                
-                if not isinstance(wav, torch.Tensor):
-                    wav = torch.tensor(wav)
-                    
-                logger.debug(f"✅ Texto {index} processado com sucesso")
-                return index, wav
-                
-            except Exception as e:
-                logger.error(f"❌ Erro ao processar texto {index}: {e}")
-                return index, None
+        device_env = str(tts_model.device) if hasattr(tts_model, 'device') else None
         
-        # Para agora, vamos usar a abordagem mais simples que sabemos que funciona
-        logger.info("🔄 Usando processamento paralelo simplificado")
+        logger.debug(f"🔧 Configuração do modelo: {model_id_coqui}, device: {device_env}")
         
-        # Determinar número de threads baseado no batch size e recursos
-        max_workers = min(len(texts), 2)  # Começar com apenas 2 threads
+        # Preparar argumentos para os workers
+        worker_args = [
+            (text, i, speaker_wav, language, model_id_coqui, device_env, kwargs)
+            for i, text in enumerate(texts)
+        ]
         
-        # Processar em paralelo
+        # Determinar número de processos
+        max_workers = min(len(texts), 2)  # Começar com 2 processos
+        
         results = {}
-        text_index_pairs = list(enumerate(texts))
         
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Configurar multiprocessing para usar spawn
+            ctx = multiprocessing.get_context('spawn')
+            
+            logger.info(f"🔄 Usando {max_workers} processos com spawn method")
+            
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers, 
+                mp_context=ctx
+            ) as executor:
+                
+                # Submeter tarefas
                 future_to_index = {
-                    executor.submit(process_single_text_simple, (text, i)): i 
-                    for i, text in enumerate(texts)
+                    executor.submit(process_single_text_worker, args): args[1] 
+                    for args in worker_args
                 }
                 
+                # Coletar resultados
                 for future in concurrent.futures.as_completed(future_to_index):
-                    index, wav = future.result()
-                    if wav is not None:
-                        results[index] = wav
-                        logger.debug(f"✅ Resultado {index} coletado com sucesso")
-                    else:
-                        logger.error(f"❌ Resultado {index} falhou")
+                    index = future_to_index[future]
+                    try:
+                        result_index, wav_array = future.result()
+                        if wav_array is not None:
+                            # Converter numpy array de volta para tensor
+                            wav_tensor = torch.tensor(wav_array)
+                            results[result_index] = wav_tensor
+                            logger.debug(f"✅ Processo {result_index}: Resultado coletado com sucesso")
+                        else:
+                            logger.error(f"❌ Processo {result_index}: Resultado nulo")
+                    except Exception as e:
+                        logger.error(f"❌ Processo {index}: Erro ao coletar resultado: {e}")
                         
         except Exception as e:
-            logger.error(f"❌ Erro no ThreadPoolExecutor: {e}")
-            # Fallback total: processamento sequencial
-            logger.info("🔄 Fallback para processamento sequencial")
+            logger.error(f"❌ Erro no ProcessPoolExecutor: {e}")
+            # Fallback para processamento sequencial no processo principal
+            logger.info("🔄 Fallback para processamento sequencial no processo principal")
             for i, text in enumerate(texts):
                 try:
                     wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
                     if not isinstance(wav, torch.Tensor):
                         wav = torch.tensor(wav)
                     results[i] = wav
-                    logger.debug(f"✅ Texto sequencial {i} processado")
+                    logger.debug(f"✅ Sequencial {i}: Processado")
                 except Exception as seq_error:
-                    logger.error(f"❌ Erro sequencial no texto {i}: {seq_error}")
+                    logger.error(f"❌ Sequencial {i}: Erro: {seq_error}")
                 
         # Criar lista ordenada de resultados válidos
         valid_results = []
@@ -795,6 +799,9 @@ def segments_coqui_tts(
     device = os.environ.get("SONITR_DEVICE")
     model = TTS(model_id_coqui).to(device)
     sampling_rate = 24000
+
+    # Adicionar atributo model_name para o ProcessPool
+    setattr(model, 'model_name', model_id_coqui)
 
     # ADICIONAR MÉTODO TTS_BATCH REAL
     setattr(model, 'tts_batch', create_tts_batch_method(model))
