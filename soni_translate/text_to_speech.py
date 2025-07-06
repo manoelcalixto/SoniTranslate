@@ -629,11 +629,11 @@ def process_single_text_worker(args):
 
 def create_tts_batch_method(tts_model):
     """
-    Cria um método tts_batch real para a instância TTS usando ProcessPoolExecutor
+    Cria um método tts_batch otimizado para a instância TTS
     """
     def tts_batch(texts: List[str], speaker_wav: str, language: str, **kwargs) -> List[torch.Tensor]:
         """
-        Processa múltiplos textos em paralelo usando processos separados
+        Processa múltiplos textos de forma otimizada no processo principal
         
         Args:
             texts: Lista de textos para processar
@@ -647,92 +647,57 @@ def create_tts_batch_method(tts_model):
         if not texts:
             return []
             
-        logger.info(f"🔥 Iniciando batch processing de {len(texts)} textos com ProcessPool")
+        logger.info(f"🔥 Iniciando batch processing OTIMIZADO de {len(texts)} textos")
         
         # Verificar se o arquivo speaker existe
         if not os.path.exists(speaker_wav):
             logger.error(f"Arquivo speaker não encontrado: {speaker_wav}")
             return []
         
-        # Obter configurações do modelo
-        model_id_coqui = getattr(tts_model, 'model_name', 'tts_models/multilingual/multi-dataset/xtts_v2')
-        if not model_id_coqui or model_id_coqui == 'tts_models/multilingual/multi-dataset/xtts_v2':
-            # Fallback para o parâmetro da função se disponível
-            model_id_coqui = 'tts_models/multilingual/multi-dataset/xtts_v2'
+        results = []
+        start_time = time.time()
         
-        device_env = str(tts_model.device) if hasattr(tts_model, 'device') else None
+        # Processamento otimizado no processo principal
+        logger.info("🔄 Processamento otimizado sequencial")
         
-        logger.debug(f"🔧 Configuração do modelo: {model_id_coqui}, device: {device_env}")
-        
-        # Preparar argumentos para os workers
-        worker_args = [
-            (text, i, speaker_wav, language, model_id_coqui, device_env, kwargs)
-            for i, text in enumerate(texts)
-        ]
-        
-        # Determinar número de processos
-        max_workers = min(len(texts), 2)  # Começar com 2 processos
-        
-        results = {}
-        
-        try:
-            # Configurar multiprocessing para usar spawn
-            ctx = multiprocessing.get_context('spawn')
-            
-            logger.info(f"🔄 Usando {max_workers} processos com spawn method")
-            
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=max_workers, 
-                mp_context=ctx
-            ) as executor:
+        for i, text in enumerate(texts):
+            try:
+                logger.debug(f"🔄 Processando texto {i+1}/{len(texts)}: {text[:50]}...")
                 
-                # Submeter tarefas
-                future_to_index = {
-                    executor.submit(process_single_text_worker, args): args[1] 
-                    for args in worker_args
-                }
+                # Usar o modelo TTS diretamente (mais confiável)
+                wav = tts_model.tts(
+                    text=text, 
+                    speaker_wav=speaker_wav, 
+                    language=language, 
+                    **kwargs
+                )
                 
-                # Coletar resultados
-                for future in concurrent.futures.as_completed(future_to_index):
-                    index = future_to_index[future]
-                    try:
-                        result_index, wav_array = future.result()
-                        if wav_array is not None:
-                            # Converter numpy array de volta para tensor
-                            wav_tensor = torch.tensor(wav_array)
-                            results[result_index] = wav_tensor
-                            logger.debug(f"✅ Processo {result_index}: Resultado coletado com sucesso")
-                        else:
-                            logger.error(f"❌ Processo {result_index}: Resultado nulo")
-                    except Exception as e:
-                        logger.error(f"❌ Processo {index}: Erro ao coletar resultado: {e}")
-                        
-        except Exception as e:
-            logger.error(f"❌ Erro no ProcessPoolExecutor: {e}")
-            # Fallback para processamento sequencial no processo principal
-            logger.info("🔄 Fallback para processamento sequencial no processo principal")
-            for i, text in enumerate(texts):
-                try:
-                    wav = tts_model.tts(text=text, speaker_wav=speaker_wav, language=language, **kwargs)
-                    if not isinstance(wav, torch.Tensor):
-                        wav = torch.tensor(wav)
-                    results[i] = wav
-                    logger.debug(f"✅ Sequencial {i}: Processado")
-                except Exception as seq_error:
-                    logger.error(f"❌ Sequencial {i}: Erro: {seq_error}")
+                if not isinstance(wav, torch.Tensor):
+                    wav = torch.tensor(wav)
+                    
+                results.append(wav)
+                logger.debug(f"✅ Texto {i+1}: Processado com sucesso")
                 
-        # Criar lista ordenada de resultados válidos
-        valid_results = []
-        for i in range(len(texts)):
-            if i in results:
-                valid_results.append(results[i])
+                # Limpeza de memória entre textos
+                if i % 2 == 0:  # A cada 2 textos
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+            except Exception as e:
+                logger.error(f"❌ Erro no texto {i+1}: {e}")
+                # Continuar com próximo texto
+                continue
         
-        logger.info(f"🔥 Batch finalizado: {len(valid_results)}/{len(texts)} sucessos")
+        end_time = time.time()
+        processing_time = end_time - start_time
         
-        if len(valid_results) != len(texts):
-            logger.warning(f"⚠️ Alguns textos falharam: {len(valid_results)}/{len(texts)} sucessos")
+        logger.info(f"🔥 Batch finalizado: {len(results)}/{len(texts)} sucessos em {processing_time:.2f}s")
+        
+        if len(results) != len(texts):
+            logger.warning(f"⚠️ Alguns textos falharam: {len(results)}/{len(texts)} sucessos")
             
-        return valid_results
+        return results
     
     return tts_batch
 
