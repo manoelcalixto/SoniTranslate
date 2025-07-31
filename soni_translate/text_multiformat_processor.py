@@ -235,7 +235,8 @@ def determine_chunk_size(file_name):
             r".+\.(wav|mp3|ogg|m4a)$"
         ): 150,  # t 250 400 api automatic split
         re.compile(r".* VITS-onnx$"): 250,  # automatic sentence split
-        re.compile(r".* OpenAI-TTS$"): 1024  # max charaters 4096
+        re.compile(r".* OpenAI-TTS$"): 1024,  # max charaters 4096
+        re.compile(r".* Gemini(Flash|Pro)-TTS$"): 1024,
     }
 
     for pattern, chunk_size in patterns.items():
