@@ -505,6 +505,26 @@ OPENAI_TTS_MODELS = [
     ">shimmer HD OpenAI-TTS"
 ]
 
+# Gemini TTS voice options (Flash and Pro models)
+GEMINI_VOICE_NAMES = [
+    "Zephyr", "Puck", "Charon",
+    "Kore", "Fenrir", "Leda",
+    "Orus", "Aoede", "Callirrhoe",
+    "Autonoe", "Enceladus", "Iapetus",
+    "Umbriel", "Algieba", "Despina",
+    "Erinome", "Algenib", "Rasalgethi",
+    "Laomedeia", "Achernar", "Alnilam",
+    "Schedar", "Gacrux", "Pulcherrima",
+    "Achird", "Zubenelgenubi", "Vindemiatrix",
+    "Sadachbia", "Sadaltager", "Sulafat"
+]
+
+GEMINI_TTS_MODELS = [
+    f"{voice} GeminiFlash-TTS" for voice in GEMINI_VOICE_NAMES
+] + [
+    f"{voice} GeminiPro-TTS" for voice in GEMINI_VOICE_NAMES
+]
+
 LANGUAGE_CODE_IN_THREE_LETTERS = {
     "Automatic detection": "aut",
     "ar": "ara",

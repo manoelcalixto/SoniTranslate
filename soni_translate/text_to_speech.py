@@ -940,6 +940,75 @@ def segments_openai_tts(
 
 
 # =====================================
+# Gemini Flash/Pro TTS
+# =====================================
+
+def segments_gemini_tts(
+    filtered_gemini_tts_segments, TRANSLATE_AUDIO_TO
+):
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client()
+    sampling_rate = 24000
+
+    for segment in tqdm(filtered_gemini_tts_segments["segments"]):
+        speaker = segment["speaker"]  # noqa
+        text = segment["text"].strip()
+        start = segment["start"]
+        tts_name = segment["tts_name"]
+
+        # Determine model and voice
+        model = (
+            "gemini-2.5-flash-preview-tts"
+            if "GeminiFlash" in tts_name
+            else "gemini-2.5-pro-preview-tts"
+        )
+        voice = tts_name.split()[0]
+
+        # make the tts audio
+        filename = f"audio/{start}.ogg"
+        logger.info(f"{text} >> {filename}")
+
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice
+                            )
+                        )
+                    ),
+                ),
+            )
+
+            data = response.candidates[0].content.parts[0].inline_data.data
+            speech_output = np.frombuffer(data, dtype=np.int16)
+
+            # Save file
+            data_tts = pad_array(
+                speech_output,
+                sampling_rate,
+            )
+
+            write_chunked(
+                file=filename,
+                samplerate=sampling_rate,
+                data=data_tts,
+                format="ogg",
+                subtype="vorbis",
+            )
+            verify_saved_file_and_size(filename)
+
+        except Exception as error:
+            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+
+
+# =====================================
 # Select task TTS
 # =====================================
 
@@ -1022,6 +1091,7 @@ def audio_segmentation_to_voice(
     pattern_coqui = re.compile(r".+\.(wav|mp3|ogg|m4a)$")
     pattern_vits_onnx = re.compile(r".* VITS-onnx$")
     pattern_openai_tts = re.compile(r".* OpenAI-TTS$")
+    pattern_gemini_tts = re.compile(r".* Gemini(Flash|Pro)-TTS$")
 
     all_segments = result_diarize["segments"]
 
@@ -1035,6 +1105,9 @@ def audio_segmentation_to_voice(
     speakers_openai_tts = find_spkr(
         pattern_openai_tts, speaker_to_voice, all_segments
     )
+    speakers_gemini_tts = find_spkr(
+        pattern_gemini_tts, speaker_to_voice, all_segments
+    )
 
     # Filter method in segments
     filtered_edge = filter_by_speaker(speakers_edge, all_segments)
@@ -1043,6 +1116,7 @@ def audio_segmentation_to_voice(
     filtered_coqui = filter_by_speaker(speakers_coqui, all_segments)
     filtered_vits_onnx = filter_by_speaker(speakers_vits_onnx, all_segments)
     filtered_openai_tts = filter_by_speaker(speakers_openai_tts, all_segments)
+    filtered_gemini_tts = filter_by_speaker(speakers_gemini_tts, all_segments)
 
     # Infer
     if filtered_edge["segments"]:
@@ -1072,6 +1146,9 @@ def audio_segmentation_to_voice(
     if filtered_openai_tts["segments"]:
         logger.info(f"OpenAI TTS: {speakers_openai_tts}")
         segments_openai_tts(filtered_openai_tts, TRANSLATE_AUDIO_TO)  # wav
+    if filtered_gemini_tts["segments"]:
+        logger.info(f"Gemini TTS: {speakers_gemini_tts}")
+        segments_gemini_tts(filtered_gemini_tts, TRANSLATE_AUDIO_TO)  # wav
 
     [result.pop("tts_name", None) for result in result_diarize["segments"]]
     return [
@@ -1080,7 +1157,8 @@ def audio_segmentation_to_voice(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        speakers_gemini_tts
     ]
 
 
@@ -1099,7 +1177,8 @@ def accelerate_segments(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        speakers_gemini_tts
     ) = valid_speakers
 
     create_directories(f"{folder_output}/audio/")
